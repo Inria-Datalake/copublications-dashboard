@@ -3,7 +3,7 @@ import io
 import numpy as np
 import pandas as pd
 import dash
-from dash import Output, Input, State, no_update, html
+from dash import Output, Input, State, no_update, html, dcc
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
@@ -262,38 +262,53 @@ def register_callbacks(app, df_base):
         )
 
     # ========================================================
-    # 0 — SIDEBAR
+    # 0 — SIDEBAR (html.Div custom — pas dbc.Offcanvas)
     # ========================================================
     @app.callback(
-        Output("sidebar", "is_open"),
-        Input("sidebar-toggle", "n_clicks"),
-        State("sidebar", "is_open"),
+        Output("sidebar", "style"),
+        [
+            Input("sidebar-toggle",  "n_clicks"),
+            Input("sidebar-close",   "n_clicks"),
+        ],
+        State("sidebar", "style"),
         prevent_initial_call=True,
     )
-    def toggle_sidebar(n_clicks, is_open):
-        return not is_open if n_clicks else is_open
+    def toggle_sidebar(open_clicks, close_clicks, current_style):
+        ctx = dash.callback_context
+        if not ctx.triggered:
+            return current_style or {"display": "none"}
+        trigger = ctx.triggered[0]["prop_id"].split(".")[0]
+        if trigger == "sidebar-toggle":
+            # Bascule ouvert/fermé
+            if current_style and current_style.get("display") == "block":
+                return {"display": "none"}
+            return {"display": "block"}
+        # sidebar-close → toujours fermer
+        return {"display": "none"}
 
     # ========================================================
-    # 0bis — Upload CSV → store-data
+    # 0bis — Export CSV → téléchargement
     # ========================================================
     @app.callback(
-        Output("store-data", "data"),
-        Input("upload-data", "contents"),
+        Output("download-csv", "data"),
+        Input("btn-export-csv", "n_clicks"),
+        [
+            State("centre", "value"),
+            State("equipe", "value"),
+            State("pays", "value"),
+            State("ville", "value"),
+            State("org", "value"),
+            State("annee", "value"),
+            State("store-data", "data"),
+        ],
         prevent_initial_call=True,
     )
-    def update_uploaded_data(contents):
-        if contents is None:
+    def export_csv(n_clicks, centres, equipes, pays, villes, orgs, annees, stored_data):
+        if not n_clicks:
             return no_update
-
-        content_type, content_string = contents.split(",", 1)
-        decoded = base64.b64decode(content_string)
-
-        try:
-            df_new = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
-        except Exception:
-            return no_update
-
-        return df_new.to_dict("records")
+        df = pd.DataFrame(stored_data) if stored_data is not None else df_base
+        dff = filter_df(df, centres, equipes, pays, villes, orgs, annees)
+        return dcc.send_data_frame(dff.to_csv, "copublications_export.csv", index=False)
 
     # ========================================================
     # 0ter — FILTRES EN CASCADE (mode doux : ne pas nettoyer les values)
@@ -416,27 +431,31 @@ def register_callbacks(app, df_base):
                 xs=12,
             )
 
+        def _fmt_n(n):
+            """Entier avec espace fine insécable comme séparateur de milliers."""
+            return f"{int(n):,}".replace(",", "\u202f")
+
         kpi_global = dbc.Row(
             [
-                kpi_card("Publications", dff["HalID"].nunique(), PRIMARY),
-                kpi_card("Villes", dff["Ville"].nunique(), PRIMARY_LIGHT),
-                kpi_card("Pays", dff["Pays"].nunique(), ACCENT),
-                kpi_card("Équipes", dff["Equipe"].nunique(), PRIMARY_LIGHT),
-                kpi_card("Auteurs Inria", dff["Auteurs_FR"].nunique(), PRIMARY),
-                kpi_card("Copubliants", dff["Auteurs_copubliants"].nunique(), PRIMARY_LIGHT),
+                kpi_card("Publications",    _fmt_n(dff["HalID"].nunique()),            PRIMARY),
+                kpi_card("Villes",          _fmt_n(dff["Ville"].nunique()),             PRIMARY_LIGHT),
+                kpi_card("Pays",            _fmt_n(dff["Pays"].nunique()),              ACCENT),
+                kpi_card("Équipes",         _fmt_n(dff["Equipe"].nunique()),            PRIMARY_LIGHT),
+                kpi_card("Auteurs Inria",   _fmt_n(dff["Auteurs_FR"].nunique()),        PRIMARY),
+                kpi_card("Copubliants",     _fmt_n(dff["Auteurs_copubliants"].nunique()), PRIMARY_LIGHT),
             ],
             className="g-2",
         )
 
         centre_counts = (
-            dff.groupby("Centre")["HalID"]
+            dff.groupby("Centre", observed=True)["HalID"]
             .nunique()
             .sort_values(ascending=False)
         )
 
         centre_badges = [
             dbc.Badge(
-                f"{c}: {n}",
+                f"{c}\u00a0: {_fmt_n(n)}",
                 pill=True,
                 className="me-1 mb-1",
                 style={
@@ -462,7 +481,7 @@ def register_callbacks(app, df_base):
 
         # ==================== BARRES PAR ANNÉE ====================
         pubs_by_year = (
-            dff.groupby("Année")["HalID"]
+            dff.groupby("Année", observed=True)["HalID"]
             .nunique()
             .reset_index(name="Publications")
         )
@@ -474,10 +493,19 @@ def register_callbacks(app, df_base):
             color="Année",
             color_discrete_sequence=QUAL_PALETTE,
         )
+        # Force les années comme entiers et les ticks uniquement sur les valeurs existantes
+        years_present = sorted(pubs_by_year["Année"].dropna().astype(int).unique().tolist())
         fig_year.update_layout(
             template=GRAPH_TEMPLATE,
             showlegend=False,
             margin=dict(l=10, r=10, t=60, b=40),
+            xaxis=dict(
+                type="category",
+                tickmode="array",
+                tickvals=years_present,
+                ticktext=[str(y) for y in years_present],
+                title="Année",
+            ),
         )
 
         # ========== Utilitaire barres arrondies (Top X) ==========
@@ -546,17 +574,17 @@ def register_callbacks(app, df_base):
             return fig
 
         fig_pays = top_bar_rounded(
-            dff.groupby("Pays")["HalID"].nunique().reset_index(name="Publications"),
+            dff.groupby("Pays", observed=True)["HalID"].nunique().reset_index(name="Publications"),
             "Pays",
         )
 
         fig_villes = top_bar_rounded(
-            dff.groupby("Ville")["HalID"].nunique().reset_index(name="Publications"),
+            dff.groupby("Ville", observed=True)["HalID"].nunique().reset_index(name="Publications"),
             "Ville",
         )
 
         fig_orgs = top_bar_rounded(
-            dff.groupby("Organisme_copubliant")["HalID"]
+            dff.groupby("Organisme_copubliant", observed=True)["HalID"]
             .nunique()
             .reset_index(name="Publications"),
             "Organisme_copubliant",
@@ -566,7 +594,7 @@ def register_callbacks(app, df_base):
         # ====================== CARTE MONDIALE ======================
         map_df = (
             dff.dropna(subset=["Latitude", "Longitude"])
-            .groupby(["Ville", "Pays", "Latitude", "Longitude"])["HalID"]
+            .groupby(["Ville", "Pays", "Latitude", "Longitude"], observed=True)["HalID"]
             .nunique()
             .reset_index(name="Publications")
         )
@@ -668,7 +696,7 @@ def register_callbacks(app, df_base):
                     continue
 
                 flow_df = (
-                    flow_raw.groupby(["Ville", "Pays", "Latitude", "Longitude"])
+                    flow_raw.groupby(["Ville", "Pays", "Latitude", "Longitude"], observed=True)
                     .agg(
                         Publications=("HalID", "nunique"),
                         UE_flag=(
@@ -1039,7 +1067,7 @@ def register_callbacks(app, df_base):
             "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3",
             "#FF6692", "#B6E880", "#636EFA", "#EF553B",
             "#00a5cc", "#27348b", "#a60f79", "#1067a3",
-            "#FF97FF", "#FECB52", "#4dc0db", "#c9191e",
+            "#FF97FF", "#FECB52", "#4dc0db", "#0e2c5e",
         ]
 
         rows = []
@@ -1380,13 +1408,13 @@ def register_callbacks(app, df_base):
                 hover = (
                     f"<b style='font-size:14px'>🏛 {attrs['label']}</b>"
                     + _sep()
-                    + f"📄 <b>{attrs['pubs']:,}</b> copublications"
+                    + f"📄 <b>{attrs['pubs']}</b> copublications"
                     f"  (<b>{pct}%</b> du total)<br>"
-                    f"👤 <b>{attrs['nb_fr']:,}</b> auteurs Inria<br>"
-                    f"🌍 <b>{attrs['nb_foreign']:,}</b> auteurs étrangers<br>"
-                    f"🗺 <b>{attrs['nb_countries']:,}</b> pays · "
-                    f"🏙 <b>{attrs.get('nb_cities',0):,}</b> villes<br>"
-                    f"🏢 <b>{attrs.get('nb_orgs',0):,}</b> organismes"
+                    f"👤 <b>{attrs['nb_fr']}</b> auteurs Inria<br>"
+                    f"🌍 <b>{attrs['nb_foreign']}</b> auteurs étrangers<br>"
+                    f"🗺 <b>{attrs['nb_countries']}</b> pays · "
+                    f"🏙 <b>{attrs.get('nb_cities',0)}</b> villes<br>"
+                    f"🏢 <b>{attrs.get('nb_orgs',0)}</b> organismes"
                     + _sep()
                     + f"<i>Pays : {countries_str}</i>"
                 )
@@ -1412,8 +1440,8 @@ def register_callbacks(app, df_base):
                     f"<b style='font-size:13px'>👤 {attrs['label']}</b>"
                     + _sep()
                     + f"🏛 Centre : <b>{centre_lbl}</b><br>"
-                    f"📄 <b>{attrs['pubs']:,}</b> copublications<br>"
-                    f"🌍 <b>{attrs.get('nb_countries',0):,}</b> pays partenaires"
+                    f"📄 <b>{attrs['pubs']}</b> copublications<br>"
+                    f"🌍 <b>{attrs.get('nb_countries',0)}</b> pays partenaires"
                     + _sep()
                     + f"<i>Principaux co-auteurs étrangers :</i><br>"
                     + top_fg_str
@@ -1450,7 +1478,7 @@ def register_callbacks(app, df_base):
                     + f"🗺 Pays : <b>{country}</b><br>"
                     f"🏙 Ville : <b>{city}</b><br>"
                     f"🏢 Organisme : <b>{org}</b><br>"
-                    f"📄 <b>{attrs['pubs']:,}</b> copublications"
+                    f"📄 <b>{attrs['pubs']}</b> copublications"
                     + _sep()
                     + f"<i>Centres Inria partenaires :</i><br>"
                     f"  {centres_str}"
@@ -1634,8 +1662,8 @@ def register_callbacks(app, df_base):
                     x=0.99, y=0.99, xref="paper", yref="paper",
                     xanchor="right", yanchor="top",
                     text=(f"<span style='color:{LEGEND_FG};font-size:11px'>"
-                          f"<b>{G.number_of_nodes():,}</b> nœuds · "
-                          f"<b>{G.number_of_edges():,}</b> liens</span>"),
+                          f"<b>{G.number_of_nodes()}</b> nœuds · "
+                          f"<b>{G.number_of_edges()}</b> liens</span>"),
                     showarrow=False, bgcolor=LEGEND_BG,
                     bordercolor=LEGEND_BORDER, borderwidth=1, borderpad=6,
                 ),
@@ -1757,7 +1785,7 @@ def register_callbacks(app, df_base):
         # =========================================================================
         if all(col in dff.columns for col in ["Centre", "Equipe", "Organisme_copubliant"]):
             sun_df = (
-                dff.groupby(["Centre", "Equipe", "Organisme_copubliant"])["HalID"]
+                dff.groupby(["Centre", "Equipe", "Organisme_copubliant"], observed=True)["HalID"]
                 .nunique()
                 .reset_index(name="Publications")
             )
@@ -1786,7 +1814,7 @@ def register_callbacks(app, df_base):
         # =========================================================================
         if all(col in dff.columns for col in ["Année", "Equipe"]):
             team_df = (
-                dff.groupby(["Année", "Equipe"])["HalID"]
+                dff.groupby(["Année", "Equipe"], observed=True)["HalID"]
                 .nunique()
                 .reset_index(name="Publications")
             )
@@ -1800,9 +1828,14 @@ def register_callbacks(app, df_base):
                 color_discrete_sequence=QUAL_PALETTE,
                 title="Évolution des copublications par équipe",
             )
+            fig_team.update_traces(
+                hovertemplate="<b>%{fullData.name}</b><br>Année : %{x}<br>Copublications : <b>%{y}</b><extra></extra>",
+            )
             fig_team.update_layout(
                 template=GRAPH_TEMPLATE,
-                hovermode="x unified",
+                hovermode="closest",
+                legend_itemclick="toggleothers",
+                legend_itemdoubleclick="toggle",
             )
         else:
             fig_team = go.Figure().update_layout(
@@ -1815,7 +1848,7 @@ def register_callbacks(app, df_base):
         # =========================================================================
         if all(col in dff.columns for col in ["Centre", "Pays", "Organisme_copubliant"]):
             sankey_df = (
-                dff.groupby(["Centre", "Pays", "Organisme_copubliant"])["HalID"]
+                dff.groupby(["Centre", "Pays", "Organisme_copubliant"], observed=True)["HalID"]
                 .nunique()
                 .reset_index(name="Publications")
                 .sort_values("Publications", ascending=False)
@@ -1892,7 +1925,7 @@ def register_callbacks(app, df_base):
         if "Centre" in dff.columns and "Domaine(s)" in dff.columns:
             dom_df = (
                 dff.dropna(subset=["Centre", "Domaine(s)"])
-                .groupby(["Centre", "Domaine(s)"])["HalID"]
+                .groupby(["Centre", "Domaine(s)"], observed=True)["HalID"]
                 .nunique()
                 .reset_index(name="Publications")
             )
@@ -1910,7 +1943,7 @@ def register_callbacks(app, df_base):
                     ]
                 else:
                     centres_to_plot = (
-                        dom_df.groupby("Centre")["Publications"]
+                        dom_df.groupby("Centre", observed=True)["Publications"]
                         .sum()
                         .sort_values(ascending=False)
                         .head(5)
@@ -1918,7 +1951,7 @@ def register_callbacks(app, df_base):
                     )
                 if not centres_to_plot:
                     centres_to_plot = (
-                        dom_df.groupby("Centre")["Publications"]
+                        dom_df.groupby("Centre", observed=True)["Publications"]
                         .sum()
                         .sort_values(ascending=False)
                         .head(5)
@@ -1927,7 +1960,7 @@ def register_callbacks(app, df_base):
 
                 # ── Top domaines — on prend jusqu'à 8 pour plus de détail ──
                 top_dom = (
-                    dom_df.groupby("Domaine(s)")["Publications"]
+                    dom_df.groupby("Domaine(s)", observed=True)["Publications"]
                     .sum()
                     .sort_values(ascending=False)
                     .head(8)
@@ -1941,7 +1974,7 @@ def register_callbacks(app, df_base):
                 # ── Normalisation en % pour comparer centres de tailles différentes ──
                 centre_totals = (
                     dom_df[dom_df["Centre"].isin(centres_to_plot)]
-                    .groupby("Centre")["Publications"]
+                    .groupby("Centre", observed=True)["Publications"]
                     .sum()
                     .to_dict()
                 )
@@ -2194,7 +2227,7 @@ def register_callbacks(app, df_base):
 
         # ── Top N pays (par volume total) ──
         top_pays_list = (
-            dff.groupby("Pays")["HalID"]
+            dff.groupby("Pays", observed=True)["HalID"]
             .nunique()
             .sort_values(ascending=False)
             .head(top_n)
@@ -2204,7 +2237,7 @@ def register_callbacks(app, df_base):
 
         # ── 1) Graphique ligne : évolution par an et par pays ──
         line_df = (
-            dff_top.groupby(["Année", "Pays"])["HalID"]
+            dff_top.groupby(["Année", "Pays"], observed=True)["HalID"]
             .nunique()
             .reset_index(name="Publications")
             .sort_values("Année")
@@ -2222,10 +2255,14 @@ def register_callbacks(app, df_base):
                 color_discrete_sequence=QUAL_PALETTE,
                 title=f"Évolution annuelle des copublications – Top {top_n} pays",
             )
-            fig_line.update_traces(line=dict(width=2.5), marker=dict(size=7))
+            fig_line.update_traces(
+                line=dict(width=2.5),
+                marker=dict(size=7),
+                hovertemplate="<b>%{fullData.name}</b><br>Année : %{x}<br>Publications : <b>%{y}</b><extra></extra>",
+            )
             fig_line.update_layout(
                 template=GRAPH_TEMPLATE,
-                hovermode="x unified",
+                hovermode="closest",
                 legend=dict(
                     orientation="v",
                     x=1.02,
@@ -2236,11 +2273,13 @@ def register_callbacks(app, df_base):
                     bgcolor="rgba(255,255,255,0.85)",
                 ),
                 margin=dict(l=10, r=10, t=50, b=40),
+                legend_itemclick="toggleothers",
+                legend_itemdoubleclick="toggle",
             )
 
         # ── 2) Heatmap pays × année ──
         pivot_df = (
-            dff_top.groupby(["Pays", "Année"])["HalID"]
+            dff_top.groupby(["Pays", "Année"], observed=True)["HalID"]
             .nunique()
             .unstack(fill_value=0)
         )
@@ -2282,7 +2321,7 @@ def register_callbacks(app, df_base):
 
         # ── 3) Barres horizontales : volume total par pays ──
         bar_df = (
-            dff_top.groupby("Pays")["HalID"]
+            dff_top.groupby("Pays", observed=True)["HalID"]
             .nunique()
             .reset_index(name="Publications")
             .sort_values("Publications", ascending=True)
@@ -2357,15 +2396,22 @@ def register_callbacks(app, df_base):
         # ────────────────────────────────────────────────────────
         # Fonction utilitaire : donut part sélection vs reste
         # ────────────────────────────────────────────────────────
-        def _donut_share(df_sel, col, filtre_vals, label_col=None):
+        def _donut_share(df_sel, col, filtre_vals, label_col=None, use_local_total=False):
             """
             Pour chaque valeur dans filtre_vals, calcule le % par rapport
-            au total global. Retourne un donut ou un bar horizontal.
+            au total pertinent :
+              - use_local_total=True  → total de df_sel (utile pour Centre, Org, Équipe
+                                         quand un filtre pays est actif)
+              - use_local_total=False → total global (défaut)
             """
             if df_sel.empty or col not in df_sel.columns:
                 return empty_fig
 
             lbl = label_col or col
+
+            # Choix du dénominateur
+            denom = total_sel if (use_local_total and total_sel > 0) else total_global
+            denom = denom or 1
 
             if filtre_vals:
                 # Sélection explicite : on montre chaque valeur + "Reste"
@@ -2373,15 +2419,15 @@ def register_callbacks(app, df_base):
                 for val in filtre_vals:
                     sub = df_sel[df_sel[col].astype(str) == str(val)]
                     n   = sub["HalID"].nunique()
-                    rows.append({"label": str(val), "n": n, "pct": n / total_global * 100})
+                    rows.append({"label": str(val), "n": n, "pct": n / denom * 100})
                 n_sel  = sum(r["n"] for r in rows)
-                n_rest = max(total_global - n_sel, 0)
-                rows.append({"label": "Reste (non sélectionné)", "n": n_rest,
-                             "pct": n_rest / total_global * 100})
+                n_rest = max(denom - n_sel, 0)
+                rest_label = "Autres (dans la sélection)" if use_local_total else "Reste (non sélectionné)"
+                rows.append({"label": rest_label, "n": n_rest,
+                             "pct": n_rest / denom * 100})
 
                 labels = [r["label"] for r in rows]
                 values = [r["pct"]   for r in rows]
-                # Couleur fixe si col == Centre, sinon QUAL_PALETTE
                 if col == "Centre":
                     colors = (
                         [get_centre_color(r["label"], i) for i, r in enumerate(rows[:-1])]
@@ -2392,7 +2438,7 @@ def register_callbacks(app, df_base):
                         [QUAL_PALETTE[i % len(QUAL_PALETTE)] for i in range(len(rows) - 1)]
                         + ["rgba(200,200,200,0.35)"]
                     )
-                pull   = [0.06] * (len(rows) - 1) + [0]
+                pull = [0.06] * (len(rows) - 1) + [0]
 
                 fig = go.Figure(go.Pie(
                     labels=labels,
@@ -2407,19 +2453,20 @@ def register_callbacks(app, df_base):
             else:
                 # Pas de sélection explicite → top 8 valeurs du df filtré
                 grp = (
-                    df_sel.groupby(col)["HalID"]
+                    df_sel.groupby(col, observed=True)["HalID"]
                     .nunique()
                     .sort_values(ascending=False)
                     .head(8)
                     .reset_index(name="n")
                 )
-                grp["pct"] = grp["n"] / total_global * 100
+                grp["pct"] = grp["n"] / denom * 100
                 n_shown  = grp["n"].sum()
-                n_autres = max(total_global - n_shown, 0)
+                n_autres = max(denom - n_shown, 0)
+                autres_label = "Autres centres" if use_local_total else "Autres / non sélectionnés"
                 grp = pd.concat([
                     grp,
-                    pd.DataFrame([{col: "Autres / non sélectionnés", "n": n_autres,
-                                   "pct": n_autres / total_global * 100}])
+                    pd.DataFrame([{col: autres_label, "n": n_autres,
+                                   "pct": n_autres / denom * 100}])
                 ], ignore_index=True)
 
                 if col == "Centre":
@@ -2462,10 +2509,14 @@ def register_callbacks(app, df_base):
             )
             return fig
 
-        fig_pays   = _donut_share(dff, "Pays",                 pays)
-        fig_centre = _donut_share(dff, "Centre",               centres)
-        fig_org    = _donut_share(dff, "Organisme_copubliant", orgs)
-        fig_equipe = _donut_share(dff, "Equipe",               equipes)
+        # Quand un filtre pays (ou ville) est actif, les donuts Centre/Org/Équipe
+        # montrent la distribution AU SEIN de la sélection, pas vs. le total mondial.
+        use_local = bool(pays or villes)
+
+        fig_pays   = _donut_share(dff, "Pays",                 pays,     use_local_total=False)
+        fig_centre = _donut_share(dff, "Centre",               centres,  use_local_total=use_local)
+        fig_org    = _donut_share(dff, "Organisme_copubliant", orgs,     use_local_total=use_local)
+        fig_equipe = _donut_share(dff, "Equipe",               equipes,  use_local_total=use_local)
 
         # ────────────────────────────────────────────────────────
         # Évolution annuelle de la part (%)
@@ -2475,7 +2526,7 @@ def register_callbacks(app, df_base):
         else:
             # Total global par année
             ann_global = (
-                df_global.groupby("Année")["HalID"]
+                df_global.groupby("Année", observed=True)["HalID"]
                 .nunique()
                 .reset_index(name="Total_global")
             )
@@ -2502,7 +2553,7 @@ def register_callbacks(app, df_base):
             for col, vals, dim_label in traces_def:
                 if col == "__global__":
                     ann_sel = (
-                        dff.groupby("Année")["HalID"]
+                        dff.groupby("Année", observed=True)["HalID"]
                         .nunique()
                         .reset_index(name="n_sel")
                     )
@@ -2525,7 +2576,7 @@ def register_callbacks(app, df_base):
                     for val in (vals or []):
                         ann_sel = (
                             dff[dff[col].astype(str) == str(val)]
-                            .groupby("Année")["HalID"]
+                            .groupby("Année", observed=True)["HalID"]
                             .nunique()
                             .reset_index(name="n_sel")
                         )
@@ -2586,11 +2637,15 @@ def register_callbacks(app, df_base):
                 md=3, sm=6, xs=12,
             )
 
+        def _fmt(n):
+            """Formate un entier avec espace comme séparateur de milliers (convention française)."""
+            return f"{int(n):,}".replace(",", "\u202f")  # espace fine insécable
+
         kpi_zone = dbc.Row([
-            _kpi("Publications sélectionnées",  f"{total_sel:,}",          PRIMARY),
-            _kpi("Total global (période)",       f"{total_global:,}",       PRIMARY_LIGHT),
-            _kpi("Part de la sélection",         f"{pct_global:.2f} %",     ACCENT),
-            _kpi("Publications hors sélection",  f"{total_global - total_sel:,}", DARK),
+            _kpi("Publications sélectionnées",  _fmt(total_sel),                    PRIMARY),
+            _kpi("Total global (période)",       _fmt(total_global),                 PRIMARY_LIGHT),
+            _kpi("Part de la sélection",         f"{pct_global:.2f} %",              ACCENT),
+            _kpi("Publications hors sélection",  _fmt(total_global - total_sel),     DARK),
         ], className="g-2 mt-1 mb-3")
 
         return fig_pays, fig_centre, fig_org, fig_equipe, fig_evol, kpi_zone
